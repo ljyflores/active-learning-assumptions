@@ -3,3 +3,5 @@ deprecated
 outputs
 unsloth_compiled_cache
 wandb
+logs
+*.pyc
