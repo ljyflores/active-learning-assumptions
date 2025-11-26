@@ -2,10 +2,17 @@ import argparse
 import json
 import os
 
+from dataclasses import asdict
 from src.loading import load_data
 from utils import run_training_on_multiple_samples
 
-MODEL_PATH = "facebook/mbart-large-50"
+model_mapping: dict[str, str] = {
+    "bart": "facebook/bart-base",
+    "t5": "google/flan-t5-base",
+    "mbart": "facebook/mbart-large-50",
+    "llama": "unsloth/Meta-Llama-3.1-8B",
+    "gemma": "unsloth/gemma-2-2b-it-bnb-4bit",
+}
 MODEL_OUTPUT_PATH = f"./results"
 
 
@@ -38,7 +45,7 @@ if __name__ == "__main__":
 
     data = load_data(
         dataset=dataset,
-        model_path=MODEL_PATH,
+        model_path=model_mapping[args_dict["model_name"]],
     )
 
     results = run_training_on_multiple_samples(
@@ -54,4 +61,4 @@ if __name__ == "__main__":
         learning_rate=args_dict["learning_rate"],
     )
     with open(output_path, "w") as f:
-        json.dump(results, f)
+        json.dump([asdict(item) for item in results], f, indent=4)
