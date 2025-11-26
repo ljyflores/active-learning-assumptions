@@ -30,15 +30,15 @@ if __name__ == "__main__":
     parser.add_argument("--filename", type=str, required=False, default=None)
     args_dict = vars(parser.parse_args())
 
-    os.environ["WANDB_PROJECT"] = f"al-assumptions-{args_dict['num_samples']}-{args_dict['num_datapoints_per_sample']}-{args_dict['num_shuffles_per_sample']}-{str(args_dict['dataset']).split('/')[-1]}"  # type: ignore
+    os.environ["WANDB_PROJECT"] = f"al-assumptions-{args_dict['model_name']}-{args_dict['num_samples']}-{args_dict['num_datapoints_per_sample']}-{args_dict['num_shuffles_per_sample']}-{str(args_dict['dataset']).split('/')[-1]}"  # type: ignore
 
     dataset = args_dict.pop("dataset")
     filename = args_dict.pop("filename")
 
-    eps_suffix = f"_{args_dict['epochs']}_eps"
+    eps_suffix = f"{args_dict['epochs']}_eps"
     hyperparam_suffix = f"_bs_{args_dict['batch_size']}_lr_{args_dict['learning_rate']}"
     output_folder = f"outputs/{dataset.split('/')[-1]}"
-    output_path = f"{output_folder}/{args_dict['num_samples']}_samples_{args_dict['num_datapoints_per_sample']}_datapoints_{args_dict['num_shuffles_per_sample']}_shuffles_{eps_suffix}{hyperparam_suffix}{args_dict.pop("suffix")}.json"
+    output_path = f"{output_folder}/{args_dict['model_name']}_{args_dict['num_samples']}_samples_{args_dict['num_datapoints_per_sample']}_datapoints_{args_dict['num_shuffles_per_sample']}_shuffles_{eps_suffix}{hyperparam_suffix}{args_dict.pop("suffix")}.json"
     args_dict["output_path"] = output_path
     if not os.path.exists(output_folder):
         os.mkdir(output_folder)

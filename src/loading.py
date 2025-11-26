@@ -85,6 +85,8 @@ def load_data(
     train_df = pd.read_csv(f"{dataset}/train_candidate.csv")  # type: ignore
     val_df = pd.read_csv(f"{dataset}/train_labeled.csv").head(50)  # type: ignore
     test_df = pd.read_csv(f"{dataset}/test_sample.csv")  # type: ignore
+    if "gemma" in model_path.lower() or "llama" in model_path.lower():
+        test_df = test_df.head(100)
     test_df = test_df.sort_values(  # type: ignore
         by="source", key=lambda s: s.str.len(), ascending=False
     ).reset_index(drop=True)
