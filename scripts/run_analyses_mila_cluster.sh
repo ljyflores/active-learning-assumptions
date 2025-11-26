@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --partition=long
 #SBATCH --job-name %name
-#SBATCH --mem=32G
+#SBATCH --mem=48G
 #SBATCH --gres=gpu:rtx8000:1
+#SBATCH --cpus-per-task=4
 
 module --force purge
 module load anaconda/3

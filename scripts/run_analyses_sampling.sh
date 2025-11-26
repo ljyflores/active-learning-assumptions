@@ -1,11 +1,11 @@
-declare -a languages=("afr" "fil" "hat" "deu")
-declare -a modes=("sampling")
-declare -a suffixes=("_5eps_500_full_shuffle")
+declare -a languages=("eng_afr" "eng_fil" "eng_deu")
+declare -a models=("t5" "llama" "gemma")
+declare -a num_datapoints=(500 2000)
 
-for mode in "${modes[@]}"; do
+for model in "${models[@]}"; do
   for language in "${languages[@]}"; do
-    for suffix in "${suffixes[@]}"; do
-      sbatch --job-name=als-$language-$mode-$suffix --output=/home/mila/f/floresl/active-learning-for-nlg/logs/eng-$language/output-$mode-$suffix --error=/home/mila/f/floresl/active-learning-for-nlg/logs/eng-$language/error-$mode-$suffix ./scripts/run_analyses_mila_cluster.sh --dataset data/eng_$language --num_samples 100 --num_rounds 500 --epochs 5 --experiment_mode $mode --suffix $suffix
+    for num_datapoint in "${num_datapoints[@]}"; do
+      sbatch --job-name=als-$language-$model-$num_datapoint --output=/home/mila/f/floresl/active-learning-assumptions/logs/eng-$language/output-$model-$num_datapoint --error=/home/mila/f/floresl/active-learning-assumptions/logs/eng-$language/error-$model-$num_datapoint ./scripts/run_analyses_mila_cluster.sh --dataset data/$language --model_name $model --num_samples 100 --num_datapoints_per_sample $num_datapoint --num_shuffles_per_sample 1 --epochs 200
     done
   done
 done
