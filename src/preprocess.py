@@ -2,22 +2,51 @@ from datasets import Dataset, DatasetDict  # pyright: ignore[reportMissingTypeSt
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast  # type: ignore
 
 
+def formatting_func_llama(example: dict[str, list[object]]):
+    system_prompt = "You are a helpful assistant."
+    user_prompt = """### Instruction:
+{}
+
+### Input:
+{}
+
+### Response:
+"""
+    return [user_prompt.format(system_prompt, s) for s in example["source"]]
+
+
+def formatting_func_gemma(example: dict[str, list[object]]):
+    prompt = """<bos><start_of_turn>user
+{}<end_of_turn>
+<start_of_turn>model
+"""
+    return [prompt.format(s) for s in example["source"]]
+
+
 def prepare_encode_function(
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
     input_column_name: str = "input",
     output_column_name: str = "label",
     id_column_name: str | None = None,
+    model_name: str | None = None,
 ):
 
     def encode(examples: dict[str, list[str]]):
         """This function takes a batch of samples,
         and tokenizes them into IDs for the model."""
         # Tokenize the Findings (the input)
+        if model_name == "llama":
+            input_strings = formatting_func_llama(examples)
+        elif model_name == "gemma":
+            input_strings = formatting_func_gemma(examples)
+        else:
+            input_strings = [str(s) for s in examples[input_column_name]]
         model_inputs = tokenizer(
-            [str(s) for s in examples[input_column_name]],
+            input_strings,
             padding=True,
             truncation=True,
             return_tensors="pt",
+            padding_side="left" if model_name in ["llama", "gemma"] else "right",
         )
 
         # Tokenize the Impressions (the output)
@@ -53,9 +82,10 @@ def encode_dataset(
     input_column_name: str,
     output_column_name: str,
     id_column_name: str | None = None,
+    model_name: str | None = None,
 ):
     encoding_fn = prepare_encode_function(
-        tokenizer, input_column_name, output_column_name, id_column_name
+        tokenizer, input_column_name, output_column_name, id_column_name, model_name
     )
     columns_to_keep = ["input_ids", "attention_mask", "labels"]
     if id_column_name is not None:
