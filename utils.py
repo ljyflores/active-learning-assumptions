@@ -359,6 +359,13 @@ def run_training(
     val_dataset = Dataset.from_pandas(val_df)
     test_dataset = Dataset.from_pandas(test_df)
 
+    if model_name == "llama":
+        response_prefix = "### Response:\n"
+    elif model_name == "gemma":
+        response_prefix = "model\n"
+    else:
+        response_prefix = None
+
     metrics_list = list[dict[str, object]]()
     for run_idx in range(num_shuffles_per_sample):
         trainer, test_dataset_processed = prepare_trainer(
@@ -370,6 +377,7 @@ def run_training(
             learning_rate=learning_rate,
             model_name=model_name,
             seed=SHUFFLE_SEEDS[run_idx],
+            response_prefix=response_prefix,
         )
         trainer.train()  # type: ignore
         metrics = cast(dict[str, object], trainer.evaluate(test_dataset_processed))  # type: ignore
