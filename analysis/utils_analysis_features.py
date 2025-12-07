@@ -4,12 +4,17 @@ from utils import open_folder
 
 
 def load_features(task_name: str, model_name: str):
-    base_path = "/home/mila/f/floresl/active-learning-assumptions/outputs"
-    unlabeled_features = pd.read_csv(
-        f"{base_path}/{task_name}/{model_name}_baseline_metrics.csv"
+    base_path = "/home/mila/f/floresl/active-learning-assumptions"
+    unlabeled_features = pd.read_csv(  # type: ignore
+        f"{base_path}/outputs/{task_name}/{model_name}_baseline_metrics.csv"
     )
+    unlabeled_delfy_scores = pd.read_csv(
+        f"{base_path}/analysis/delfy_features/delfy_{task_name}.csv"
+    )
+    unlabeled_features["source_delfy"] = unlabeled_delfy_scores["source_delfy"]
+    unlabeled_features["target_delfy"] = unlabeled_delfy_scores["target_delfy"]
     unlabeled_hidden_states = torch.load(
-        f"{base_path}/{task_name}/{model_name}_baseline_hidden_states.pt",
+        f"{base_path}/outputs/{task_name}/{model_name}_baseline_hidden_states.pt",
         map_location=(
             torch.device("cpu")
             if not torch.cuda.is_available()
@@ -48,6 +53,12 @@ def add_numeric_features_of_samples(
     )
     df_sampling["dropout_bald_mean"] = df_sampling["indices"].apply(  # type: ignore
         lambda lst: df_features.loc[lst]["dropout_bald"].mean()  # type: ignore
+    )
+    df_sampling["source_delfy_mean"] = df_sampling["indices"].apply(  # type: ignore
+        lambda lst: df_features.loc[lst]["source_delfy"].mean()  # type: ignore
+    )
+    df_sampling["target_delfy_mean"] = df_sampling["indices"].apply(  # type: ignore
+        lambda lst: df_features.loc[lst]["target_delfy"].mean()  # type: ignore
     )
     return df_sampling
 
