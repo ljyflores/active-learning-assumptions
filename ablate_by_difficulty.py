@@ -7,7 +7,7 @@ import torch
 import wandb
 
 from copy import deepcopy
-from datasets import Dataset  # type: ignore
+from datasets import Dataset, DatasetDict  # type: ignore
 from string import punctuation
 from transformers import EvalPrediction, Seq2SeqTrainingArguments, TrainingArguments, Seq2SeqTrainer, DataCollatorForSeq2Seq, PreTrainedTokenizer, PreTrainedModel  # type: ignore
 from transformers.trainer_utils import EvalLoopOutput
@@ -31,6 +31,7 @@ model_mapping: dict[str, str] = {
     "t5": "google/flan-t5-base",
     "mbart": "facebook/mbart-large-50",
     "llama": "unsloth/Meta-Llama-3.1-8B",
+    "gemma": "unsloth/gemma-2-2b-it-bnb-4bit",
 }
 
 
@@ -43,6 +44,27 @@ def compute_confidence_scores(logits: Tensor):
     scores["avg_token_log_prob"] = [float(x) for x in average_token_log_prob.cpu()]
     scores["avg_token_entropy"] = [float(x) for x in average_token_entropy.cpu()]
     return scores
+
+
+def formatting_func_llama(example: dict[str, str]):
+    system_prompt = "You are a helpful assistant."
+    user_prompt = """### Instruction:
+{}
+
+### Input:
+{}
+
+### Response:
+{}"""
+    return user_prompt.format(system_prompt, example["source"], example["target"])
+
+
+def formatting_func_gemma(example: dict[str, str]):
+    prompt = """<bos><start_of_turn>user
+{}<end_of_turn>
+<start_of_turn>model
+{}<end_of_turn><eos>"""
+    return prompt.format(example["source"], example["target"])
 
 
 class SFTTrainerWithLogits(SFTTrainer):
@@ -216,6 +238,7 @@ def main(
     ablate_by_confidence: bool = False,
     prefinetune_size: int | None = None,
     wandb_off: bool = False,
+    get_preds_only: bool = False,
 ):
     # Declare metrics
     if dataset in QA_DATASETS:
@@ -249,15 +272,17 @@ def main(
 
     # Declare paths
     model_path = model_mapping[model_name]
-    MODEL_OUTPUT_PATH = f"{dataset.split('/')[-1]}_eps_{epochs}_{model_path.split('/')[-1]}_seed_{seed}{suffix}"
     if degenerate_case:
-        MODEL_OUTPUT_PATH += "_degenerate"
+        suffix += "_degenerate"
     if random_case:
-        MODEL_OUTPUT_PATH += "_random"
+        suffix += "_random"
     if ablate_by_confidence:
-        MODEL_OUTPUT_PATH += "_confidence"
+        suffix += "_confidence"
     if prefinetune_size is not None:
-        MODEL_OUTPUT_PATH += f"_pft_{prefinetune_size}"
+        suffix += f"_pft_{prefinetune_size}"
+    if get_preds_only:
+        suffix += "_preds"
+    MODEL_OUTPUT_PATH = f"{dataset.split('/')[-1]}_eps_{epochs}_{model_path.split('/')[-1]}_seed_{seed}{suffix}"
 
     # Read in data
     training_df = pd.read_csv(f"{dataset}/train_labeled.csv")  # type: ignore
@@ -266,6 +291,16 @@ def main(
     test_df = test_df.sort_values(
         by="source", key=lambda s: s.str.len(), ascending=False
     ).reset_index(drop=True)
+
+    if model_name == "llama":
+        response_prefix = "### Response:\n"
+        formatting_func = formatting_func_llama
+    elif model_name == "gemma":
+        response_prefix = "model\n"
+        formatting_func = formatting_func_gemma
+    else:
+        response_prefix = None
+        formatting_func = None
 
     # Add to labeled data if needed
     if (prefinetune_size is not None) and (len(training_df) < prefinetune_size):
@@ -283,31 +318,20 @@ def main(
 
     # Load model and tokenizer
     instantiate_model_func, tokenizer = load_model(  # type: ignore
-        model_path=model_path, dataset=dataset, is_classification=False
+        model_path=model_path
     )
     tokenizer = cast(PreTrainedTokenizer, tokenizer)
     model = instantiate_model_func(seed=seed)  # type: ignore
     model = cast(PreTrainedModel, model)
 
-    def formatting_func(example: dict[str, object]) -> str:
-        system_prompt = "You are a helpful assistant."
-        user_prompt = """### Instruction:
-    {}
-
-    ### Input:
-    {}
-
-    ### Response:
-    {}"""
-        text = user_prompt.format(system_prompt, example["source"], example["target"])
-        return text
-
-    def prepare_dataset(dataset: Dataset):
+    def prepare_dataset(dataset: Dataset | DatasetDict):
         dataset = encode_dataset(
             dataset,
             tokenizer,
             "source",
             "target",
+            id_column_name=None,
+            model_name=model_name,
         )
         assert isinstance(dataset, Dataset)
         dataset.set_format(  # pyright: ignore[reportUnknownMemberType]
@@ -329,7 +353,6 @@ def main(
         return logits.argmax(dim=-1)
 
     def compute_metrics(eval_pred: EvalPrediction):
-        using_sft_trainer = False
         label_raw = eval_pred.label_ids
         source_raw = eval_pred.inputs
         if isinstance(eval_pred.predictions, tuple):
@@ -342,7 +365,7 @@ def main(
         else:
             pred_raw = eval_pred.predictions
             logits = None
-        using_sft_trainer = True
+
         pred_raw = cast(Tensor, pred_raw)
         label_raw = cast(Tensor, label_raw)
         source_raw = cast(Tensor, source_raw)
@@ -351,35 +374,41 @@ def main(
         sources = clean_output_tensor(source_raw)
         labels = clean_output_tensor(label_raw)
 
-        if using_sft_trainer:
-            response_prefix = "### Response"
+        if response_prefix is not None:
             predictions = [
                 p.split(response_prefix)[-1].strip(remove_chars) for p in predictions
             ]
             labels = [l.split(response_prefix)[-1].strip(remove_chars) for l in labels]
-            sources = [
-                s.split(response_prefix)[-1].strip(remove_chars) for s in sources
-            ]
 
         labels = [[s] for s in labels]  # labels must be a list of LISTS
         for item in list(zip(predictions, labels, sources))[:2]:
             print(f"Source: {item[2]}\n\nLabel: {item[1]}\n\nPrediction: {item[0]}")
 
-        all_metrics = eval(sources, predictions, labels, eval_metrics)
+        all_metrics: dict[str, float | list[float] | list[str]] = eval(
+            sources, predictions, labels, eval_metrics
+        )  # type: ignore
         confidence_metrics = (
             compute_confidence_scores(torch.tensor(logits))
             if logits is not None
             else {}
         )
         all_metrics.update(confidence_metrics)
+        if get_preds_only:
+            all_metrics["predictions"] = predictions
+            all_metrics["labels"] = [lst[0] for lst in labels]
+            all_metrics["sources"] = sources
         return all_metrics
 
-    # Tokenize datasets
-    training_pool_tokenized = prepare_dataset(training_pool)
-    unlabeled_pool_tokenized = prepare_dataset(unlabeled_pool)
-    test_pool_tokenized = prepare_dataset(test_pool)
+    training_pool_tokenized = None
+    unlabeled_pool_tokenized = None
+    test_pool_tokenized = None
 
     if model_name in ["t5", "mbart", "bart"]:
+        # Tokenize datasets
+        training_pool_tokenized = prepare_dataset(training_pool)
+        unlabeled_pool_tokenized = prepare_dataset(unlabeled_pool)
+        test_pool_tokenized = prepare_dataset(test_pool)
+
         training_args = Seq2SeqTrainingArguments(
             f"outputs/{MODEL_OUTPUT_PATH}",
             # Training parameters
@@ -417,7 +446,7 @@ def main(
             processing_class=tokenizer,
             compute_metrics=compute_metrics,  # type: ignore
         )
-    elif "llama" in model_name:
+    elif model_name in ["llama", "gemma"]:
         training_args = TrainingArguments(
             # TRAIN ARGUMENTS
             num_train_epochs=epochs,
@@ -473,7 +502,15 @@ def main(
         unlabeled_df["scores"] = candidate_results[f"eval_{indiv_metric}"]
     else:
         unlabeled_df["scores"] = candidate_results[indiv_metric]
-    unlabeled_df = unlabeled_df.sort_values(by="scores").reset_index(drop=True)
+
+    if get_preds_only:
+        unlabeled_df["sources"] = candidate_results["sources"]
+        unlabeled_df["labels"] = candidate_results["labels"]
+        unlabeled_df["predictions"] = candidate_results["predictions"]
+        unlabeled_df.to_csv(f"analysis/{MODEL_OUTPUT_PATH}.csv")
+        return
+
+    unlabeled_df = unlabeled_df.sort_values(by="scores").reset_index(drop=True)  # type: ignore
 
     def prepare_sft_trainer(
         trainer: SFTTrainerWithLogits,
@@ -515,7 +552,7 @@ def main(
     # Select easy/hard samples
     outputs = {}
     if random_case:
-        final_samples = unlabeled_df.sample(n=finetune_size, random_state=seed)
+        final_samples = unlabeled_df.sample(n=finetune_size, random_state=seed)  # type: ignore
         final_dataset = Dataset.from_pandas(final_samples)
         final_dataset_tokenized = prepare_dataset(final_dataset)
 
@@ -527,7 +564,8 @@ def main(
                 reinit=True,
             )
             training_args.run_name = f"{MODEL_OUTPUT_PATH}_random"
-        if "llama" in model_name:
+        if model_name in ["llama", "gemma"]:
+            assert isinstance(trainer, SFTTrainerWithLogits)
             new_trainer = prepare_sft_trainer(
                 trainer,
                 training_dataset=final_dataset,
@@ -536,6 +574,9 @@ def main(
                 tokenizer=tokenizer,
             )
         else:
+            assert isinstance(trainer, Seq2SeqTrainerWithLogits)
+            assert isinstance(training_args, Seq2SeqTrainingArguments)
+            assert test_pool_tokenized is not None
             new_trainer = prepare_seq2seq_trainer(
                 trainer,
                 tokenized_training_dataset=final_dataset_tokenized,
@@ -565,7 +606,8 @@ def main(
                     reinit=True,
                 )
                 training_args.run_name = f"{MODEL_OUTPUT_PATH}_{percentile}"
-            if "llama" in model_name:
+            if model_name in ["llama", "gemma"]:
+                assert isinstance(trainer, SFTTrainerWithLogits)
                 new_trainer = prepare_sft_trainer(
                     trainer,
                     training_dataset=final_dataset,
@@ -574,6 +616,9 @@ def main(
                     tokenizer=tokenizer,
                 )
             else:
+                assert isinstance(trainer, Seq2SeqTrainerWithLogits)
+                assert isinstance(training_args, Seq2SeqTrainingArguments)
+                assert test_pool_tokenized is not None
                 new_trainer = prepare_seq2seq_trainer(
                     trainer,
                     tokenized_training_dataset=final_dataset_tokenized,
@@ -581,8 +626,8 @@ def main(
                     training_args=training_args,
                     tokenizer=tokenizer,
                 )
-            new_trainer.train()
-            test_results = new_trainer.evaluate()
+            new_trainer.train()  # type: ignore
+            test_results = new_trainer.evaluate()  # type: ignore
 
             print(percentile, test_results)
             outputs[percentile] = test_results
@@ -605,6 +650,7 @@ if __name__ == "__main__":
     parser.add_argument("--ablate_by_confidence", action="store_true", required=False)
     parser.add_argument("--prefinetune_size", type=int, default=None, required=False)
     parser.add_argument("--wandb_off", action="store_true", required=False)
+    parser.add_argument("--get_preds_only", action="store_true", required=False)
     args_dict = vars(parser.parse_args())
 
     if args_dict["wandb_off"]:
