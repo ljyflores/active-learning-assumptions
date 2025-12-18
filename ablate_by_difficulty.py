@@ -9,7 +9,7 @@ import wandb
 from copy import deepcopy
 from datasets import Dataset, DatasetDict  # type: ignore
 from string import punctuation
-from transformers import EvalPrediction, Seq2SeqTrainingArguments, TrainingArguments, Seq2SeqTrainer, DataCollatorForSeq2Seq, PreTrainedTokenizer, PreTrainedModel  # type: ignore
+from transformers import EvalPrediction, Seq2SeqTrainingArguments, TrainingArguments, Seq2SeqTrainer, DataCollatorForSeq2Seq, PreTrainedTokenizer, PreTrainedModel, EarlyStoppingCallback  # type: ignore
 from transformers.trainer_utils import EvalLoopOutput
 from torch import Tensor
 from trl import SFTTrainer  # type: ignore
@@ -92,7 +92,7 @@ class SFTTrainerWithLogits(SFTTrainer):
         dataloader,
         description: str,
         prediction_loss_only: bool = None,
-        ignore_keys=None,
+        ignore_keys: list[str] | None = None,
         metric_key_prefix: str = "eval",
     ):
         self.model.eval()
@@ -146,10 +146,10 @@ class SFTTrainerWithLogits(SFTTrainer):
 class Seq2SeqTrainerWithLogits(Seq2SeqTrainer):
     def prediction_step(
         self,
-        model,
-        inputs,
+        model: PreTrainedModel,
+        inputs: dict[str, object],
         prediction_loss_only: bool,
-        ignore_keys=None,
+        ignore_keys: list[str] | None = None,
     ):
         # Get loss, generated tokens, labels from parent
         loss, generated_tokens, labels = super().prediction_step(
@@ -167,8 +167,8 @@ class Seq2SeqTrainerWithLogits(Seq2SeqTrainer):
         self,
         dataloader,
         description: str,
-        prediction_loss_only: bool = None,
-        ignore_keys=None,
+        prediction_loss_only: bool | None = None,
+        ignore_keys: list[str] | None = None,
         metric_key_prefix: str = "eval",
     ):
         self.model.eval()
@@ -282,12 +282,14 @@ def main(
         suffix += f"_pft_{prefinetune_size}"
     if get_preds_only:
         suffix += "_preds"
-    MODEL_OUTPUT_PATH = f"{dataset.split('/')[-1]}_eps_{epochs}_{model_path.split('/')[-1]}_seed_{seed}{suffix}"
+    MODEL_OUTPUT_PATH = f"{dataset.split('/')[-1]}_eps_{epochs}_{model_path.split('/')[-1]}_ft_{finetune_size}_seed_{seed}{suffix}"
 
     # Read in data
     training_df = pd.read_csv(f"{dataset}/train_labeled.csv")  # type: ignore
     unlabeled_df = pd.read_csv(f"{dataset}/train_candidate.csv")  # type: ignore
     test_df = pd.read_csv(f"{dataset}/test_sample.csv") if "eng_" in dataset else pd.read_csv(f"{dataset}/test.csv")  # type: ignore
+    val_df = test_df.head(50)
+    test_df = test_df.loc[50:]
     test_df = test_df.sort_values(
         by="source", key=lambda s: s.str.len(), ascending=False
     ).reset_index(drop=True)
@@ -314,6 +316,7 @@ def main(
 
     training_pool = Dataset.from_pandas(training_df)
     unlabeled_pool = Dataset.from_pandas(unlabeled_df)
+    val_pool = Dataset.from_pandas(val_df)
     test_pool = Dataset.from_pandas(test_df)
 
     # Load model and tokenizer
@@ -333,7 +336,6 @@ def main(
             id_column_name=None,
             model_name=model_name,
         )
-        assert isinstance(dataset, Dataset)
         dataset.set_format(  # pyright: ignore[reportUnknownMemberType]
             type="torch", columns=["input_ids", "attention_mask", "labels"]
         )
@@ -353,17 +355,17 @@ def main(
         return logits.argmax(dim=-1)
 
     def compute_metrics(eval_pred: EvalPrediction):
-        label_raw = eval_pred.label_ids
-        source_raw = eval_pred.inputs
-        if isinstance(eval_pred.predictions, tuple):
-            pred_raw = eval_pred.predictions[0]
-            logits = eval_pred.predictions[1]
+        label_raw = eval_pred.label_ids  # type: ignore
+        source_raw = eval_pred.inputs  # type: ignore
+        if isinstance(eval_pred.predictions, tuple):  # type: ignore
+            pred_raw = eval_pred.predictions[0]  # type: ignore
+            logits = eval_pred.predictions[1]  # type: ignore
             if pred_raw.shape == logits.shape:
                 pred_raw = custom_preprocess_logits(
                     torch.Tensor(logits), torch.Tensor(label_raw)
                 )
         else:
-            pred_raw = eval_pred.predictions
+            pred_raw = eval_pred.predictions  # type: ignore
             logits = None
 
         pred_raw = cast(Tensor, pred_raw)
@@ -399,20 +401,23 @@ def main(
             all_metrics["sources"] = sources
         return all_metrics
 
-    training_pool_tokenized = None
-    unlabeled_pool_tokenized = None
-    test_pool_tokenized = None
-
+    # Tokenize the dataset if using Seq2SeqTrainer
     if model_name in ["t5", "mbart", "bart"]:
-        # Tokenize datasets
         training_pool_tokenized = prepare_dataset(training_pool)
         unlabeled_pool_tokenized = prepare_dataset(unlabeled_pool)
-        test_pool_tokenized = prepare_dataset(test_pool)
+        eval_pool_tokenized = prepare_dataset(
+            DatasetDict({"test": test_pool, "val": val_pool})
+        )
+    else:
+        training_pool_tokenized = None
+        unlabeled_pool_tokenized = None
+        eval_pool_tokenized = None
 
+    if model_name in ["t5", "mbart", "bart"]:
         training_args = Seq2SeqTrainingArguments(
             f"outputs/{MODEL_OUTPUT_PATH}",
             # Training parameters
-            num_train_epochs=epochs,
+            num_train_epochs=10,
             learning_rate=5e-5,
             warmup_steps=0,
             per_device_train_batch_size=train_batch_size,
@@ -449,7 +454,7 @@ def main(
     elif model_name in ["llama", "gemma"]:
         training_args = TrainingArguments(
             # TRAIN ARGUMENTS
-            num_train_epochs=epochs,
+            num_train_epochs=10,
             per_device_train_batch_size=8,
             gradient_accumulation_steps=1,
             optim="adamw_8bit",
@@ -515,7 +520,7 @@ def main(
     def prepare_sft_trainer(
         trainer: SFTTrainerWithLogits,
         training_dataset: Dataset,
-        testing_dataset: Dataset,
+        testing_dataset: Dataset | DatasetDict,
         training_args: TrainingArguments,
         tokenizer: PreTrainedTokenizer,
     ):
@@ -528,13 +533,14 @@ def main(
             args=training_args,
             preprocess_logits_for_metrics=custom_preprocess_logits,
             compute_metrics=compute_metrics,  # type: ignore
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
         )
         return new_trainer
 
     def prepare_seq2seq_trainer(
         trainer: Seq2SeqTrainerWithLogits,
         tokenized_training_dataset: Dataset,
-        tokenized_testing_dataset: Dataset,
+        tokenized_testing_dataset: Dataset | DatasetDict,
         training_args: Seq2SeqTrainingArguments,
         tokenizer: PreTrainedTokenizer,
     ):
@@ -546,8 +552,14 @@ def main(
             data_collator=DataCollatorForSeq2Seq(tokenizer),
             processing_class=tokenizer,
             compute_metrics=compute_metrics,  # type: ignore
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
         )
         return new_trainer
+
+    # Put back early stopping, now using the validation set
+    training_args.num_train_epochs = epochs
+    training_args.eval_strategy = "epoch"
+    training_args.metric_for_best_model = f"eval_val_{eval_metrics[0]}"
 
     # Select easy/hard samples
     outputs = {}
@@ -569,18 +581,18 @@ def main(
             new_trainer = prepare_sft_trainer(
                 trainer,
                 training_dataset=final_dataset,
-                testing_dataset=test_pool,
+                testing_dataset=DatasetDict({"test": test_pool, "val": val_pool}),
                 training_args=training_args,
                 tokenizer=tokenizer,
             )
         else:
             assert isinstance(trainer, Seq2SeqTrainerWithLogits)
             assert isinstance(training_args, Seq2SeqTrainingArguments)
-            assert test_pool_tokenized is not None
+            assert eval_pool_tokenized is not None
             new_trainer = prepare_seq2seq_trainer(
                 trainer,
-                tokenized_training_dataset=final_dataset_tokenized,
-                tokenized_testing_dataset=test_pool_tokenized,
+                tokenized_training_dataset=cast(Dataset, final_dataset_tokenized),
+                tokenized_testing_dataset=eval_pool_tokenized,
                 training_args=training_args,
                 tokenizer=tokenizer,
             )
@@ -611,18 +623,18 @@ def main(
                 new_trainer = prepare_sft_trainer(
                     trainer,
                     training_dataset=final_dataset,
-                    testing_dataset=test_pool,
+                    testing_dataset=DatasetDict({"test": test_pool, "val": val_pool}),
                     training_args=training_args,
                     tokenizer=tokenizer,
                 )
             else:
                 assert isinstance(trainer, Seq2SeqTrainerWithLogits)
                 assert isinstance(training_args, Seq2SeqTrainingArguments)
-                assert test_pool_tokenized is not None
+                assert eval_pool_tokenized is not None
                 new_trainer = prepare_seq2seq_trainer(
                     trainer,
-                    tokenized_training_dataset=final_dataset_tokenized,
-                    tokenized_testing_dataset=test_pool_tokenized,
+                    tokenized_training_dataset=cast(Dataset, final_dataset_tokenized),
+                    tokenized_testing_dataset=eval_pool_tokenized,
                     training_args=training_args,
                     tokenizer=tokenizer,
                 )
